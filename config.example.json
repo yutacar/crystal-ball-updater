@@ -1,0 +1,13 @@
+{
+  "uuid": "ABCD-1234",
+  "hub": "1",
+  "port": "2",
+  "filename": "00_display.mp4",
+  "interval_minutes": 30,
+  "duration_minutes": 35,
+  "lead_minutes": 3,
+  "device_timeout": 25,
+  "cycles": 0,
+  "pi5_shared_power": false,
+  "state_dir": "/path/to/private/state"
+}

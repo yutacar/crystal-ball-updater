@@ -1,0 +1,13 @@
+[Unit]
+Description=Periodic USB video updater
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 %h/.local/share/crystal-ball-updater/crystal_ball_updater.py --config %h/.config/crystal-ball-updater/config.json
+Restart=on-failure
+RestartSec=60
+KillSignal=SIGINT
+TimeoutStopSec=90
+
+[Install]
+WantedBy=default.target
