@@ -1,0 +1,19 @@
+{
+  "uuid": "ABCD-1234",
+  "hub": "1",
+  "port": "2",
+  "filename": "00_display.mp4",
+  "interval_minutes": 30,
+  "duration_minutes": 35,
+  "lead_minutes": 1,
+  "device_timeout": 25,
+  "cycles": 0,
+  "pi5_shared_power": false,
+  "connect_before_seconds": 60,
+  "connect_deadline_seconds": 45,
+  "resume_old_on_abort": true,
+  "producer_command": ["/usr/bin/python3", "/home/pi/.local/share/crystal-ball-updater/assemble_playlist.py",
+    "--clips-dir", "/home/pi/.local/share/crystal-ball-updater/clips",
+    "--duration-minutes", "{duration}", "--output", "{output}"],
+  "state_dir": "/path/to/private/state"
+}

@@ -3,6 +3,7 @@
 Crystal Memory Video Ball（型番: crystal 701）向けのLinux常駐ツールです。USB接続で動画をコピーし、
 切断すると再生する、このディスプレイの動画を定期的に自動更新します。
 時計動画の生成から、指定UUID・USBポートへの定期転送、再生用の接続切断までを提供します。
+時計の代わりにフラクタル模様を5分ごとに切り替えるシャッフルモードも同梱しています。
 標準の時計生成器を同梱しているので、別の生成プログラムは不要です。ニュース・天気などの
 独自動画へ差し替える場合は、外部生成コマンドを設定できます。
 
@@ -35,7 +36,7 @@ Crystal Memory Video Ball（型番: crystal 701）向けのLinux常駐ツール�
 - コピー後のSHA256照合、同一ファイルの置換、アンマウント後の切断。
 - 無効な動画、短すぎる動画、期限超過、機器未検出時は非ゼロ終了。
 - ロックで多重実行を防ぎ、状態ディレクトリに成功・失敗・次回予定を保存。
-- 時計生成を標準提供。任意の外部生成コマンドもJSONのargv配列で指定できます。
+- 時計生成を標準提供。フラクタル模様のシャッフルモードと、任意の外部生成コマンド（JSONのargv配列）も指定できます。
 - Raspberry Pi 5の共通USB給電へ対応（明示オプション、既定OFF）。
 
 ## 要件
@@ -133,6 +134,47 @@ python3 generate_clock_video.py --start-time 2026-11-16T12:00:00+09:00 \
 再生開始の遅延・先頭から再生されるか・選択ファイルは実機依存です。
 転送と切断の成功は、実画面の正確な同期を保証するものではありません。
 
+## シャッフルモード（フラクタル）
+
+時計の代わりに、6種類の幾何学アニメーションを5分ごとにランダムな順で切り替えて表示します。
+時刻表示がないので、毎回の生成は不要です。事前に用意したクリップを再エンコードせずに連結する
+だけなので、生成は数秒で終わり、すぐに転送できます。
+
+| パターン | 動き | 見た目 |
+| --- | --- | --- |
+| `koch` コッホ曲線 | 線を描き足して枝分かれ | 雪の結晶風 |
+| `sierpinski` シェルピンスキーのギャスケット | 三角形の中に小さな三角形が増える | 幾何学模様 |
+| `hilbert` ヒルベルト曲線 | 折れ曲がる線が空間を埋める | 迷路・回路風 |
+| `dragon` ドラゴン曲線 | 折り返す線が伸びていく | 有機的な模様 |
+| `tree` フラクタルツリー | 枝が増えて広がる | 植物風 |
+| `lissajous` リサージュ曲線 | 波の位相を変えて形を変える | 滑らかな輪・網目 |
+
+各クリップは段階ごとに図形を描き進め、完成形を少し見せてからフェードアウトし、色を変えて
+描き直します（75秒周期。リサージュは60秒ごとに周波数比が変わります）。
+
+1. クリップを一度だけ生成します（Raspberry Pi上でもPCでも可。5分×6本で合計約55MB）。
+
+   ```bash
+   python3 generate_fractal_video.py --all --output-dir ~/.local/share/crystal-ball-updater/clips
+   # 1種類だけ: --pattern koch --output koch.mp4   長さ: --minutes 5   配色を固定: --seed 1
+   ```
+
+2. `config.shuffle.example.json` を元に設定します。`producer_command` が `assemble_playlist.py` を
+   呼び、クリップを1巡ごとにシャッフルして（同じパターンが連続しないように）`duration_minutes` 分
+   つなぎます。生成が速いため `lead_minutes` は1分で足ります。
+
+   ```bash
+   python3 assemble_playlist.py --clips-dir clips --duration-minutes 35 --output playlist.mp4
+   ```
+
+- `clips` に置いた任意の `.mp4` が候補になります。不要なパターンはファイルを削除し、自作の動画を
+  加える場合は同じエンコード設定（480×480・H.264 Baseline・15fps・無音）にそろえてください。
+  長さは `--clip-minutes`（既定5分）と同じである必要があります。
+- 時刻を表示しないので、旧動画を先頭から再生し直しても問題になりません。設定例では
+  `resume_old_on_abort` を有効にしています。
+- 連結した動画は35分で約30〜90MBです（動きの多いリサージュは5分で約30MBと大きめ）。コピーと読み戻しの
+  時間が `connect_before_seconds` に収まるか、初回に確認してください。
+
 ## 独自の動画への拡張
 
 `producer_command` を追加すると標準時計を置き換えます。例えば設定JSONへ次を追加します。
@@ -180,7 +222,8 @@ Pi 5はポート別給電に対応すると報告しますが、物理4端子の
 
 ```bash
 mkdir -p ~/.local/share/crystal-ball-updater ~/.config/crystal-ball-updater ~/.config/systemd/user
-cp crystal_ball_updater.py generate_clock_video.py ~/.local/share/crystal-ball-updater/
+cp crystal_ball_updater.py generate_clock_video.py generate_fractal_video.py assemble_playlist.py \
+   ~/.local/share/crystal-ball-updater/
 cp config.json ~/.config/crystal-ball-updater/
 cp crystal-ball-updater.service ~/.config/systemd/user/
 systemctl --user daemon-reload

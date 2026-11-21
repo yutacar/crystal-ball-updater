@@ -121,36 +121,33 @@ def parse_args(argv=None):
     return args
 
 
-def generate(args):
+def encode_movie(frames, fps, output, overwrite=False):
+    """Encode an iterable of 480x480 RGB images to H.264 MP4 at `output`.
+
+    Shared by every bundled generator so their clips can be joined without re-encoding.
+    Failed encodes never replace an existing movie.
+    """
     ffmpeg = shutil.which('ffmpeg')
     if not ffmpeg:
         raise ValueError('ffmpeg is required on PATH (with libx264 support)')
-    font = find_font(args.font)
-    if args.output.exists() and not args.overwrite:
-        raise ValueError(f'Output exists: {args.output}; use --overwrite')
-    args.output.parent.mkdir(parents=True, exist_ok=True)
-    renderer = Renderer(args.color, font, args.speed, args.fps)
-    frames = args.duration_minutes * 60 * args.fps
-    started = time.monotonic()
-    print(f'Start label: {args.start.isoformat()} (seconds truncated). '
-          f'{frames} frames; {args.duration_minutes} min.', flush=True)
-    # Same filesystem for atomic rename. Failed encodes never replace an existing movie.
-    with tempfile.TemporaryDirectory(prefix='.clock-', dir=args.output.parent) as directory:
-        movie = Path(directory) / 'clock.mp4'
+    if output.exists() and not overwrite:
+        raise ValueError(f'Output exists: {output}; use --overwrite')
+    output.parent.mkdir(parents=True, exist_ok=True)
+    # Same filesystem for atomic rename.
+    with tempfile.TemporaryDirectory(prefix='.clock-', dir=output.parent) as directory:
+        movie = Path(directory) / 'movie.mp4'
         command = [ffmpeg, '-hide_banner', '-loglevel', 'error', '-nostdin',
                    '-f', 'rawvideo', '-pixel_format', 'rgb24', '-video_size', '480x480',
-                   '-framerate', str(args.fps), '-i', 'pipe:0', '-an',
+                   '-framerate', str(fps), '-i', 'pipe:0', '-an',
                    '-c:v', 'libx264', '-preset', 'fast', '-crf', '20',
                    '-profile:v', 'baseline', '-level:v', '3.1', '-pix_fmt', 'yuv420p',
                    '-maxrate', '2000k', '-bufsize', '4000k',
-                   '-g', str(args.fps * 2), '-movflags', '+faststart', str(movie)]
+                   '-g', str(fps * 2), '-movflags', '+faststart', str(movie)]
         with tempfile.TemporaryFile() as errors:
             process = subprocess.Popen(command, stdin=subprocess.PIPE, stderr=errors)
             try:
-                for index in range(frames):
-                    process.stdin.write(renderer.frame(frame_time(args.start, index, args.fps), index).tobytes())
-                    if index and index % (args.fps * 60) == 0:
-                        print(f'Rendered {index // (args.fps * 60)}/{args.duration_minutes} min', flush=True)
+                for frame in frames:
+                    process.stdin.write(frame.tobytes())
                 process.stdin.close()
                 code = process.wait()
             except BaseException as exc:
@@ -167,11 +164,28 @@ def generate(args):
             if code:
                 errors.seek(0)
                 raise RuntimeError(errors.read().decode(errors='replace'))
-        if args.overwrite:
-            movie.replace(args.output)
+        if overwrite:
+            movie.replace(output)
         else:
             # Exclusive creation also protects against another writer during encoding.
-            os.link(movie, args.output)
+            os.link(movie, output)
+
+
+def generate(args):
+    font = find_font(args.font)
+    renderer = Renderer(args.color, font, args.speed, args.fps)
+    frames = args.duration_minutes * 60 * args.fps
+    started = time.monotonic()
+    print(f'Start label: {args.start.isoformat()} (seconds truncated). '
+          f'{frames} frames; {args.duration_minutes} min.', flush=True)
+
+    def images():
+        for index in range(frames):
+            yield renderer.frame(frame_time(args.start, index, args.fps), index)
+            if index and index % (args.fps * 60) == 0:
+                print(f'Rendered {index // (args.fps * 60)}/{args.duration_minutes} min', flush=True)
+
+    encode_movie(images(), args.fps, args.output, args.overwrite)
     elapsed = time.monotonic() - started
     size = args.output.stat().st_size
     print(f'Created {args.output}: {size:,} bytes in {elapsed:.2f}s '
