@@ -25,6 +25,27 @@ LOG = logging.getLogger('crystal-updater')
 # Only consulted by the opt-in Raspberry Pi 5 shared-power guard.
 DISPLAY_USB_ID = ('10d6', '1101')
 
+# Seconds before the playback start that must remain when the old movie is about to be
+# replaced, leaving room for the directory fsync and unmount.
+TRANSFER_MARGIN_SECONDS = 15
+
+# util-linux umount exit status for "umount failure", returned e.g. when the filesystem
+# was already unmounted by someone else.
+UMOUNT_FAILURE = 32
+
+
+def now():
+    return datetime.now().astimezone()
+
+
+def seconds_until(moment):
+    return (moment - now()).total_seconds()
+
+
+def sleep_until(moment):
+    while (remaining := seconds_until(moment)) > 0:
+        time.sleep(min(remaining, 0.2))
+
 
 def command(args, privileged=False, timeout=60):
     if privileged and os.geteuid() != 0:
@@ -161,8 +182,8 @@ def digest(path):
         return hashlib.file_digest(stream, 'sha256').hexdigest()
 
 
-def install_movie(source, destination):
-    """On-device staging and read-back before replacing this tool's one filename."""
+def stage_movie(source, destination):
+    """Copy next to `destination` and verify by read-back; the old movie is untouched."""
     temporary = destination.parent / '.clock-upload.tmp'
     if temporary.exists() or destination.is_symlink():
         raise RuntimeError('unsafe destination or stale upload; inspect manually')
@@ -173,6 +194,15 @@ def install_movie(source, destination):
             os.fsync(dst.fileno())
         if digest(source) != digest(temporary):
             raise RuntimeError('USB copy checksum mismatch')
+    except BaseException:
+        temporary.unlink(missing_ok=True)
+        raise
+    return temporary
+
+
+def commit_movie(temporary, destination):
+    """Replace the old movie with a staged one. From here on the old movie is gone."""
+    try:
         os.replace(temporary, destination)
         directory = os.open(destination.parent, os.O_RDONLY | os.O_DIRECTORY)
         try:
@@ -183,14 +213,15 @@ def install_movie(source, destination):
         temporary.unlink(missing_ok=True)
 
 
+def install_movie(source, destination):
+    """On-device staging and read-back before replacing this tool's one filename."""
+    commit_movie(stage_movie(source, destination), destination)
+
+
 def wait_for_start(start):
-    if (datetime.now().astimezone() - start).total_seconds() > 0.5:
+    if seconds_until(start) < -0.5:
         raise RuntimeError('playback deadline missed; refusing incorrect clock start')
-    while True:
-        remaining = (start - datetime.now().astimezone()).total_seconds()
-        if remaining <= 0:
-            return
-        time.sleep(min(remaining, 0.2))
+    sleep_until(start)
 
 
 def write_status(path, data):
@@ -205,14 +236,76 @@ def mounts(device):
     return [p for row in info['blockdevices'] for p in (row.get('mountpoints') or []) if p]
 
 
+def unmount(mountpoint, device):
+    try:
+        command(['umount', str(mountpoint)], privileged=True)
+    except subprocess.CalledProcessError as exc:
+        # Accept "umount failure" only when the filesystem is verifiably gone.
+        if exc.returncode != UMOUNT_FAILURE or os.path.ismount(mountpoint) or mounts(device):
+            raise
+        LOG.warning('umount exited %d but %s is not mounted; continuing', exc.returncode, mountpoint)
+
+
+def resume_old_movie(args, device):
+    """After a failure before the old movie was replaced, cut USB power so the display
+    plays the old movie again. Only when the filesystem is verifiably unmounted."""
+    try:
+        device = device or device_path(args.uuid, args.hub, args.port)
+        if os.path.ismount(args.state_dir/'mount') or (device and mounts(device)):
+            LOG.warning('USB filesystem still mounted; leaving USB connected')
+            return False
+        power(args, 'off')
+    except (OSError, RuntimeError, ValueError, LookupError, subprocess.SubprocessError) as exc:
+        LOG.warning('could not return to the old movie: %s', exc)
+        return False
+    return True
+
+
 def cycle(args, start=None):
-    start = start or next_start(datetime.now().astimezone(), args.lead_minutes)
+    """One refresh. args.usb_state tells the caller where USB was left if this raises."""
+    start = start or next_start(now(), args.lead_minutes)
+    connect_at = start - timedelta(seconds=args.connect_before_seconds)
+    connect_deadline = start - timedelta(seconds=args.connect_deadline_seconds)
+    args.usb_state = 'not_connected'
     with tempfile.TemporaryDirectory(prefix='crystal-clock-', dir=args.state_dir) as work:
         movie = Path(work) / 'clock.mp4'
+        budget = seconds_until(connect_deadline)
+        if budget <= 0:
+            raise RuntimeError('no time left to generate before the connect deadline')
         command(producer_command(args.producer_command, start, args.duration_minutes, movie),
-                timeout=args.lead_minutes * 60)
+                timeout=budget)
         validate_video(movie, args.duration_minutes)
-        device = connect_device(args)
+        # Connecting stops playback, so keep the old movie on screen as long as possible.
+        sleep_until(connect_at)
+        if seconds_until(connect_deadline) <= 0:
+            raise RuntimeError('connect deadline passed; USB not connected, old movie keeps playing')
+        args.usb_state = 'connected'
+        device = None
+        try:
+            device = connect_device(args)
+            transfer(args, device, movie, start)
+        except Exception as exc:
+            replaced = getattr(exc, 'replaced', False)
+            if not replaced and args.resume_old_on_abort and resume_old_movie(args, device):
+                args.usb_state = 'disconnected_old_movie'
+            raise
+        wait_for_start(start)
+        power(args, 'off')
+        args.usb_state = 'disconnected'
+        status = {'status': 'transferred_and_disconnected', 'start': start.isoformat(),
+                  'uuid': args.uuid, 'visual_playback_verified': False,
+                  'interval_minutes': args.interval_minutes,
+                  'next_start': (start+timedelta(minutes=args.interval_minutes)).isoformat()}
+        write_status(args.state_dir/'last_success.json', status)
+        LOG.info('transferred_and_disconnected: %s (screen confirmation required)', start.isoformat())
+        return start
+
+
+def transfer(args, device, movie, start):
+    """Mount, replace the movie, unmount. On failure, exc.replaced tells whether the
+    old movie is already gone."""
+    replaced = False
+    try:
         existing = mounts(device)
         if len(existing) > 1:
             raise RuntimeError('multiple mounts; refusing to disconnect')
@@ -226,25 +319,25 @@ def cycle(args, start=None):
                 command(['mount', '-o', f'nosuid,nodev,noexec,uid={os.getuid()},gid={os.getgid()}',
                          str(device), str(mountpoint)], privileged=True)
                 mounted = True
-            # Check time before changing the old file; keep a margin for unmount.
-            if (start - datetime.now().astimezone()).total_seconds() < 15:
-                raise RuntimeError('transfer deadline too close; old movie preserved')
-            install_movie(movie, mountpoint/args.filename)
+            destination = mountpoint/args.filename
+            temporary = stage_movie(movie, destination)
+            try:
+                # Check time before changing the old file; keep a margin for unmount.
+                if seconds_until(start) < TRANSFER_MARGIN_SECONDS:
+                    raise RuntimeError('transfer deadline too close; old movie preserved')
+                replaced = True
+                commit_movie(temporary, destination)
+            finally:
+                temporary.unlink(missing_ok=True)
             LOG.info('copy_verified start=%s sha256=%s', start.isoformat(), digest(movie))
         finally:
             if mounted:
-                command(['umount', str(mountpoint)], privileged=True)
+                unmount(mountpoint, device)
         if mounts(device):
             raise RuntimeError('device still mounted; refusing USB power off')
-        wait_for_start(start)
-        power(args, 'off')
-        status = {'status': 'transferred_and_disconnected', 'start': start.isoformat(),
-                  'uuid': args.uuid, 'visual_playback_verified': False,
-                  'interval_minutes': args.interval_minutes,
-                  'next_start': (start+timedelta(minutes=args.interval_minutes)).isoformat()}
-        write_status(args.state_dir/'last_success.json', status)
-        LOG.info('transferred_and_disconnected: %s (screen confirmation required)', start.isoformat())
-        return start
+    except Exception as exc:
+        exc.replaced = replaced
+        raise
 
 
 def parse_args(argv=None):
@@ -257,16 +350,17 @@ def parse_args(argv=None):
         except (OSError, ValueError) as exc:
             raise SystemExit(f'cannot load config: {exc}') from exc
         allowed = {'uuid','hub','port','filename','interval_minutes','duration_minutes',
-                   'lead_minutes','device_timeout','cycles','state_dir','producer_command','pi5_shared_power'}
+                   'lead_minutes','device_timeout','cycles','state_dir','producer_command','pi5_shared_power',
+                   'connect_before_seconds','connect_deadline_seconds','resume_old_on_abort'}
         if not isinstance(config,dict) or set(config)-allowed:
             raise SystemExit('config contains unsupported keys')
         argv = []
         for key,value in config.items():
             if key == 'producer_command':
                 argv += ['--producer-command-json',json.dumps(value)]
-            elif key == 'pi5_shared_power':
-                if not isinstance(value,bool):raise SystemExit('pi5_shared_power must be boolean')
-                if value:argv.append('--pi5-shared-power')
+            elif key in ('pi5_shared_power', 'resume_old_on_abort'):
+                if not isinstance(value,bool):raise SystemExit(f'{key} must be boolean')
+                if value:argv.append(f"--{key.replace('_','-')}")
             else:
                 argv.append(f"--{key.replace('_','-')}={value}")
     p = argparse.ArgumentParser(description=__doc__)
@@ -283,6 +377,12 @@ def parse_args(argv=None):
     p.add_argument('--lead-minutes', type=int, default=3)
     p.add_argument('--device-timeout', type=float, default=20)
     p.add_argument('--cycles', type=int, default=1, help='0: keep refreshing; default: one cycle')
+    p.add_argument('--connect-before-seconds', type=float, default=60,
+                   help='connect USB this many seconds before playback start (default: 60)')
+    p.add_argument('--connect-deadline-seconds', type=float, default=45,
+                   help='skip connecting when fewer seconds remain (default: 45)')
+    p.add_argument('--resume-old-on-abort', action='store_true',
+                   help='on failure before replacement, cut USB power to replay the old movie')
     p.add_argument('--state-dir', type=Path, default=Path.home()/'.local/state/crystal-ball-updater')
     a = p.parse_args(argv)
     try:
@@ -302,6 +402,10 @@ def parse_args(argv=None):
     if (a.interval_minutes < 1 or a.lead_minutes < 1 or a.duration_minutes < a.interval_minutes + a.lead_minutes
             or a.cycles < 0 or not 0 < a.device_timeout <= 120):
         p.error('positive timings required; duration must cover interval + generation lead')
+    if not (TRANSFER_MARGIN_SECONDS < a.connect_deadline_seconds <= a.connect_before_seconds
+            <= a.lead_minutes * 60):
+        p.error(f'need {TRANSFER_MARGIN_SECONDS} < connect-deadline-seconds'
+                ' <= connect-before-seconds <= lead-minutes*60')
     return a
 
 
@@ -327,12 +431,12 @@ def main():
                     return 0
                 target = started + timedelta(minutes=args.interval_minutes)
                 next_prepare = target - timedelta(minutes=args.lead_minutes)
-                while datetime.now().astimezone() < next_prepare:
-                    time.sleep(max(0, min(1, (next_prepare-datetime.now().astimezone()).total_seconds())))
+                sleep_until(next_prepare)
         except (OSError, RuntimeError, ValueError, LookupError, subprocess.SubprocessError) as exc:
-            LOG.exception('refresh_failed: %s; USB left connected for inspection', exc)
+            usb = getattr(args, 'usb_state', 'unknown')
+            LOG.exception('refresh_failed: %s; usb=%s', exc, usb)
             write_status(args.state_dir/'last_failure.json', {
-                'time': datetime.now().astimezone().isoformat(), 'error': str(exc)})
+                'time': now().isoformat(), 'error': str(exc), 'usb': usb})
             return 1
 
 

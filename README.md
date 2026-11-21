@@ -19,11 +19,15 @@ Crystal Memory Video Ball（型番: crystal 701）向けのLinux常駐ツール�
 
 1. 再生開始時刻を決める（現在の分を切り捨て + `lead_minutes` + 1分）。
 2. その時刻から始まる動画を生成し、FFprobeで動画ストリームと長さを確認する。
-3. USBポートをONにし、UUIDと接続ポートの両方が一致する機器を待つ。
-4. マウントし、機器上の一時ファイルへコピーしてSHA256を照合してから、同名ファイルを置換する。
-5. アンマウントし、マウントが残っていないことを確認する。
-6. 開始時刻ちょうどにUSBポートをOFFにする（ディスプレイが再生を始める）。
-7. `last_success.json` を書き、次回（`interval_minutes` 後）の `lead_minutes` 前まで待つ。
+   生成は「接続の締切」（開始の `connect_deadline_seconds` 秒前）までに終わらなければ打ち切る。
+3. 開始の `connect_before_seconds` 秒前（既定60秒）まで待つ。USB接続中はディスプレイが再生を
+   止めるため、それまで旧動画を表示し続ける。この時点で締切を過ぎていたら接続せずに中止する。
+4. USBポートをONにし、UUIDと接続ポートの両方が一致する機器を待つ。
+5. マウントし、機器上の一時ファイルへコピーしてSHA256を照合する。開始まで15秒以上残っていれば
+   同名ファイルを置換する（残っていなければ旧動画を残して中止）。
+6. アンマウントし、マウントが残っていないことを確認する。
+7. 開始時刻ちょうどにUSBポートをOFFにする（ディスプレイが再生を始める）。
+8. `last_success.json` を書き、次回（`interval_minutes` 後）の `lead_minutes` 前まで待つ。
 
 ## 機能
 
@@ -94,6 +98,9 @@ youruser ALL=(root) NOPASSWD: /usr/sbin/uhubctl, /usr/bin/mount, /usr/bin/umount
 | `state_dir` | `~/.local/state/crystal-ball-updater` | ロック・状態ファイル・一時ファイルの置き場。 |
 | `producer_command` | 同梱の時計生成器 | 外部生成コマンドのargv配列（後述）。 |
 | `pi5_shared_power` | `false` | Raspberry Pi 5の全ポート給電サイクルを許可（後述）。 |
+| `connect_before_seconds` | `60` | 開始の何秒前にUSBを接続するか。`lead_minutes × 60` 以下。 |
+| `connect_deadline_seconds` | `45` | 開始までの残りがこれ未満なら接続しない。15より大きく `connect_before_seconds` 以下。 |
+| `resume_old_on_abort` | `false` | 接続後・置換前に失敗したら、未マウントを確認して切断し旧動画を再生させる（後述）。 |
 
 ### 状態ディレクトリ
 
@@ -186,6 +193,41 @@ journalctl --user -u crystal-ball-updater.service -f
 ログイン前から動かす場合は管理者がlinger（`loginctl enable-linger`）または適切なシステムサービスを
 設定してください。画面の表示は本体の電池・再生ファイル選択・再生開始遅延にも依存します。
 
+## タイミングの既定値と前提
+
+| 値 | 既定 | 意味 |
+| --- | --- | --- |
+| `connect_before_seconds` | 60秒 | USB接続を始める時刻。接続から切断まで画面は旧動画を再生しません。 |
+| `connect_deadline_seconds` | 45秒 | これを切ったら接続しません。旧動画はそのまま再生を続けます。 |
+| 置換の余裕 | 15秒 | 置換時点でこれを切っていたら旧動画を残して中止します（固定値）。 |
+
+既定値は、作者の実機環境（crystal 701）で、予定60秒前に接続し、給電の切り直しを
+含めて毎回定刻に切断できた実績に基づきます。残り45秒からの接続や、別のハブ・USB速度・
+動画サイズでの余裕は検証していません。次の合計が `connect_before_seconds - 15` に収まるよう、
+初回は `"cycles": 1` で所要時間をログで確認して調整してください。
+
+- 機器の認識（`device_timeout` が上限。`pi5_shared_power` 使用時はさらに約15秒）
+- マウント、コピー、読み戻しによるSHA256照合（動画サイズとUSB書き込み速度に比例）
+
+## 失敗したときのUSBの状態
+
+失敗は `last_failure.json` の `usb` に記録されます。systemdの再起動（既定60秒後）で新しい予定から
+やり直します。再起動時に状態ファイルは読まないため、壊れていても再起動は妨げられません。
+
+| `usb` | 状況 | 画面 |
+| --- | --- | --- |
+| `not_connected` | 生成の失敗・遅延で接続前に中止。 | 旧動画の再生が続く。 |
+| `connected` | 接続後に失敗し、USBを接続したまま残した。 | 再生しない。 |
+| `disconnected_old_movie` | 置換前の失敗で、未マウントを確認して切断した（`resume_old_on_abort`）。 | 旧動画を再生し直す。 |
+
+`resume_old_on_abort` は既定で無効です。切断するとディスプレイは旧動画を**先頭から**再生し直すため、
+同梱の時計では約30分前の時刻が表示されます。ニュース・天気など、多少古くても表示を続けたい
+動画で有効にしてください。置換を始めた後、またはマウントが残っている可能性がある場合は、
+この設定に関わらず切断しません。
+
+`umount` が終了コード32を返しても、マウントポイントと機器のどちらにもマウントが残っていない
+ことを確認できた場合は成功として続行します（自動アンマウントされた場合など）。
+
 ## トラブルシューティング
 
 | メッセージ | 原因と対処 |
@@ -193,8 +235,9 @@ journalctl --user -u crystal-ball-updater.service -f
 | `USB device UUID=… not detected` | 機器が認識されていません。ケーブル、`uuid`、`device_timeout`、ハブの給電切替対応を確認。 |
 | `UUID … is not on expected USB port` | 同じUUIDの機器が別のポートにあります。`hub` / `port` を確認。 |
 | `unsafe destination or stale upload` | 機器上に前回中断したコピーの `.clock-upload.tmp` が残っています。内容を確認して手動で削除。 |
-| `transfer deadline too close` | 生成や認識に時間がかかり、開始時刻まで15秒を切りました。`lead_minutes` を増やす。 |
-| `playback deadline missed` | コピーが開始時刻を過ぎました。動画は置換済みですが切断していません。`lead_minutes` を増やす。 |
+| `transfer deadline too close` | 認識やコピーに時間がかかり、開始時刻まで15秒を切りました。`connect_before_seconds` を増やす。 |
+| `connect deadline passed` / `no time left to generate` | 生成が接続の締切に間に合いませんでした。旧動画は再生を続けています。`lead_minutes` を増やすか生成を速くする。 |
+| `playback deadline missed` | 置換後の処理が開始時刻を過ぎました。動画は置換済みですが切断していません。`connect_before_seconds` を増やす。 |
 | `sudo: a password is required` | 非対話sudoが未設定です。「権限」を参照。 |
 | `another instance holds …refresh.lock` | 同じ `state_dir` で別のプロセスが動作中です。 |
 

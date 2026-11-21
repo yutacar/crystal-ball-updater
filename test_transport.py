@@ -61,7 +61,7 @@ class RefreshTests(unittest.TestCase):
             usb = root/'usb'; usb.mkdir()
             state = root/'state'; state.mkdir()
             args = SimpleNamespace(uuid='ABCD-1234', hub='1', port='2',
-                device_timeout=1, interval_minutes=15, pi5_shared_power=False, lead_minutes=1, duration_minutes=2, fps=1, state_dir=state, producer_command=['python','demo.py','--output','{output}'], filename='00_clock_auto.mp4')
+                device_timeout=1, interval_minutes=15, pi5_shared_power=False, lead_minutes=1, duration_minutes=2, fps=1, state_dir=state, producer_command=['python','demo.py','--output','{output}'], filename='00_clock_auto.mp4', connect_before_seconds=60, connect_deadline_seconds=45, resume_old_on_abort=False)
             events = []
             def fake_command(cmd, **kw):
                 if '--output' in cmd:
@@ -74,7 +74,7 @@ class RefreshTests(unittest.TestCase):
                  patch.object(self.m, 'wait_device', return_value=Path('/dev/fake')), \
                  patch.object(self.m, 'mounts', side_effect=[[str(usb)], []]*2), \
                  patch.object(self.m, 'command', side_effect=fake_command), \
-                 patch.object(self.m, 'wait_for_start'), patch.object(self.m, 'validate_video'):
+                 patch.object(self.m, 'wait_for_start'), patch.object(self.m, 'validate_video'), patch.object(self.m, 'sleep_until'):
                 self.m.cycle(args)
                 first = (usb/'00_clock_auto.mp4').read_bytes()
                 self.m.cycle(args)
@@ -91,7 +91,7 @@ class RefreshTests(unittest.TestCase):
             state = root/'state'; state.mkdir()
             args = SimpleNamespace(uuid='x', hub='1', port='2', device_timeout=1,
                 lead_minutes=1, duration_minutes=2, fps=1, state_dir=state, producer_command=['python','demo.py','--output','{output}'], pi5_shared_power=False,
-                filename='00_clock_auto.mp4')
+                filename='00_clock_auto.mp4', connect_before_seconds=60, connect_deadline_seconds=45, resume_old_on_abort=False)
             events = []
             def fake_command(cmd, **kw):
                 if '--output' in cmd:
@@ -102,7 +102,7 @@ class RefreshTests(unittest.TestCase):
             with patch.object(self.m, 'power', side_effect=lambda a, v: events.append(v)), \
                  patch.object(self.m, 'wait_device', return_value=Path('/dev/fake')), \
                  patch.object(self.m, 'mounts', return_value=[str(usb)]), \
-                 patch.object(self.m, 'command', side_effect=fake_command), patch.object(self.m, 'validate_video'):
+                 patch.object(self.m, 'command', side_effect=fake_command), patch.object(self.m, 'validate_video'), patch.object(self.m, 'sleep_until'):
                 with self.assertRaisesRegex(RuntimeError, 'unmount failed'):
                     self.m.cycle(args)
             self.assertEqual(events, ['on'])
@@ -114,7 +114,7 @@ class RefreshTests(unittest.TestCase):
             args = SimpleNamespace(uuid='x', hub='1', port='2', device_timeout=1,
                 lead_minutes=1, duration_minutes=2, state_dir=state, pi5_shared_power=False,
                 producer_command=['python','demo.py','--output','{output}'],
-                filename='00_clock_auto.mp4')
+                filename='00_clock_auto.mp4', connect_before_seconds=60, connect_deadline_seconds=45, resume_old_on_abort=False)
             def fake_command(cmd, **kw):
                 if '--output' in cmd:
                     Path(cmd[cmd.index('--output')+1]).write_bytes(b'movie')
@@ -127,7 +127,7 @@ class RefreshTests(unittest.TestCase):
                  patch.object(self.m, 'wait_device', return_value=Path('/dev/fake')), \
                  patch.object(self.m, 'mounts', return_value=[]), \
                  patch.object(self.m, 'command', side_effect=fake_command), \
-                 patch.object(self.m, 'validate_video'):
+                 patch.object(self.m, 'validate_video'), patch.object(self.m, 'sleep_until'):
                 with self.assertRaisesRegex(RuntimeError, 'unmount failed'):
                     self.m.cycle(args)
             survivors = [p.name for p in state.rglob('*.mp4')]
