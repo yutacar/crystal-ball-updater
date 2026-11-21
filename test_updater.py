@@ -77,10 +77,13 @@ class ProducerTests(unittest.TestCase):
     def test_two_cycles_target_exact_fifteen_minute_gap(self):
         with tempfile.TemporaryDirectory() as d:
             first=datetime.now().astimezone()-timedelta(minutes=15)
-            args=SimpleNamespace(state_dir=Path(d),cycles=2,interval_minutes=15,lead_minutes=3)
+            args=SimpleNamespace(state_dir=Path(d),cycles=2,interval_minutes=15,lead_minutes=3,
+                                 duration_minutes=20,retry_before_end_minutes=1)
             with patch.object(self.m,'parse_args',return_value=args), \
+                 patch.object(self.m,'sleep_until'), \
                  patch.object(self.m,'cycle',side_effect=[first,first+timedelta(minutes=15)]) as cycles:
                 self.assertEqual(self.m.main(),0)
-            self.assertEqual(cycles.call_args_list[1].args[1],first+timedelta(minutes=15))
+            targets=[call.args[1] for call in cycles.call_args_list]
+            self.assertEqual(targets[1]-targets[0],timedelta(minutes=15))
 
 if __name__=='__main__':unittest.main()

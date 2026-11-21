@@ -224,6 +224,83 @@ def wait_for_start(start):
     sleep_until(start)
 
 
+CYCLE_ERRORS = (OSError, RuntimeError, ValueError, LookupError, subprocess.SubprocessError)
+
+
+def boot_id():
+    try:
+        return Path('/proc/sys/kernel/random/boot_id').read_text().strip()
+    except OSError:
+        return None
+
+
+def playback_path(args):
+    return args.state_dir/'playback.json'
+
+
+def read_playback(args):
+    """The movie on screen, if it has played without interruption since its start.
+
+    playback.json exists only in that case: it is written after a successful refresh and
+    deleted right before USB is connected. A reboot powers the USB ports, so a record
+    from another boot is ignored as well."""
+    path = playback_path(args)
+    try:
+        data = json.loads(path.read_text())
+        record = {'start': datetime.fromisoformat(data['start']),
+                  'duration_minutes': int(data['duration_minutes']),
+                  'next_slot': datetime.fromisoformat(data['next_slot']),
+                  'retry_used': data['retry_used'] is True,
+                  'boot_id': data.get('boot_id')}
+        if record['start'].tzinfo is None or record['next_slot'].tzinfo is None:
+            raise ValueError('timestamps need a UTC offset')
+    except FileNotFoundError:
+        return None
+    except (OSError, ValueError, KeyError, TypeError, AttributeError) as exc:
+        LOG.warning('ignoring unreadable %s: %s', path, exc)
+        return None
+    if record['boot_id'] != boot_id():
+        LOG.info('playback record is from another boot; starting a fresh schedule')
+        return None
+    return record
+
+
+def write_playback(args, record):
+    write_status(playback_path(args), {
+        'start': record['start'].isoformat(), 'duration_minutes': record['duration_minutes'],
+        'next_slot': record['next_slot'].isoformat(), 'retry_used': record['retry_used'],
+        'boot_id': record['boot_id']})
+
+
+def retry_start(args, playback):
+    """Switch time for the one retry before the playing movie ends, or None."""
+    if not playback or playback['retry_used'] or not args.retry_before_end_minutes:
+        return None
+    at = playback['start'] + timedelta(
+        minutes=playback['duration_minutes'] - args.retry_before_end_minutes)
+    if seconds_until(at - timedelta(minutes=args.lead_minutes)) < 0:
+        return None
+    return at
+
+
+def restored_plan(args):
+    """After a restart, continue the schedule of the movie still on screen."""
+    playback = read_playback(args)
+    if not playback:
+        return None, None
+    slot = playback['next_slot']
+    if seconds_until(slot - timedelta(minutes=args.lead_minutes)) >= 0:
+        LOG.info('restored schedule: next refresh at %s', slot.isoformat())
+        return slot, slot
+    retry = retry_start(args, playback)
+    if retry:
+        write_playback(args, {**playback, 'retry_used': True})
+        LOG.info('restored schedule: retry at %s before the old movie ends', retry.isoformat())
+        return retry, slot
+    LOG.info('no time left in the schedule of the movie on screen; starting a fresh schedule')
+    return None, None
+
+
 def write_status(path, data):
     staging = path.with_suffix('.tmp')
     staging.write_text(json.dumps(data, indent=2) + '\n')
@@ -279,6 +356,8 @@ def cycle(args, start=None):
         sleep_until(connect_at)
         if seconds_until(connect_deadline) <= 0:
             raise RuntimeError('connect deadline passed; USB not connected, old movie keeps playing')
+        # From here on the old movie is no longer known to play without interruption.
+        playback_path(args).unlink(missing_ok=True)
         args.usb_state = 'connected'
         device = None
         try:
@@ -351,7 +430,8 @@ def parse_args(argv=None):
             raise SystemExit(f'cannot load config: {exc}') from exc
         allowed = {'uuid','hub','port','filename','interval_minutes','duration_minutes',
                    'lead_minutes','device_timeout','cycles','state_dir','producer_command','pi5_shared_power',
-                   'connect_before_seconds','connect_deadline_seconds','resume_old_on_abort'}
+                   'connect_before_seconds','connect_deadline_seconds','resume_old_on_abort',
+                   'retry_before_end_minutes'}
         if not isinstance(config,dict) or set(config)-allowed:
             raise SystemExit('config contains unsupported keys')
         argv = []
@@ -383,6 +463,9 @@ def parse_args(argv=None):
                    help='skip connecting when fewer seconds remain (default: 45)')
     p.add_argument('--resume-old-on-abort', action='store_true',
                    help='on failure before replacement, cut USB power to replay the old movie')
+    p.add_argument('--retry-before-end-minutes', type=int, default=1,
+                   help='daemon mode: retry a failed preparation once, this many minutes before '
+                        'the movie on screen ends (default: 1; 0 disables)')
     p.add_argument('--state-dir', type=Path, default=Path.home()/'.local/state/crystal-ball-updater')
     a = p.parse_args(argv)
     try:
@@ -400,7 +483,8 @@ def parse_args(argv=None):
     if not re.fullmatch(r'[A-Za-z0-9-]+', a.uuid) or not re.fullmatch(r'\d+(?:[.-]\d+)*', a.hub) or not re.fullmatch(r'\d+', a.port):
         p.error('invalid UUID or USB topology')
     if (a.interval_minutes < 1 or a.lead_minutes < 1 or a.duration_minutes < a.interval_minutes + a.lead_minutes
-            or a.cycles < 0 or not 0 < a.device_timeout <= 120):
+            or a.cycles < 0 or not 0 < a.device_timeout <= 120
+            or not 0 <= a.retry_before_end_minutes < a.duration_minutes):
         p.error('positive timings required; duration must cover interval + generation lead')
     if not (TRANSFER_MARGIN_SECONDS < a.connect_deadline_seconds <= a.connect_before_seconds
             <= a.lead_minutes * 60):
@@ -421,24 +505,52 @@ def main():
             LOG.error('another instance holds %s; exiting', lock.name)
             return 1
         try:
-            count = 0
-            target = None
-            while True:
-                # A failed cycle exits nonzero; systemd retries with a bounded delay.
-                started = cycle(args, target)
-                count += 1
-                if args.cycles and count >= args.cycles:
-                    return 0
-                target = started + timedelta(minutes=args.interval_minutes)
-                next_prepare = target - timedelta(minutes=args.lead_minutes)
-                sleep_until(next_prepare)
-        except (OSError, RuntimeError, ValueError, LookupError, subprocess.SubprocessError) as exc:
-            usb = getattr(args, 'usb_state', 'unknown')
-            LOG.exception('refresh_failed: %s; usb=%s', exc, usb)
-            write_status(args.state_dir/'last_failure.json', {
-                'time': now().isoformat(), 'error': str(exc), 'usb': usb})
+            return run(args)
+        except CYCLE_ERRORS as exc:
+            record_failure(args, exc, None)
             return 1
 
+
+def record_failure(args, exc, retry):
+    usb = getattr(args, 'usb_state', 'unknown')
+    LOG.error('refresh_failed: %s; usb=%s; retry_at=%s', exc, usb,
+              retry.isoformat() if retry else None, exc_info=exc)
+    write_status(args.state_dir/'last_failure.json', {
+        'time': now().isoformat(), 'error': str(exc), 'usb': usb,
+        'old_movie_uninterrupted': usb == 'not_connected',
+        'retry_at': retry.isoformat() if retry else None})
+
+
+def run(args):
+    """Refresh on the interval grid. In daemon mode (cycles 0), a failure before USB was
+    connected is retried once shortly before the movie on screen ends, and a restart
+    continues the schedule of that movie."""
+    daemon = args.cycles == 0
+    target, slot = restored_plan(args) if daemon else (None, None)
+    count = 0
+    while True:
+        if target is None:
+            target = slot = next_start(now(), args.lead_minutes)
+        sleep_until(target - timedelta(minutes=args.lead_minutes))
+        try:
+            started = cycle(args, target)
+        except CYCLE_ERRORS as exc:
+            playback = read_playback(args) if daemon and args.usb_state == 'not_connected' else None
+            retry = retry_start(args, playback)
+            record_failure(args, exc, retry)
+            if retry is None:
+                # systemd restarts the service with a bounded delay.
+                return 1
+            write_playback(args, {**playback, 'retry_used': True})
+            target = retry
+            continue
+        next_slot = slot + timedelta(minutes=args.interval_minutes)
+        write_playback(args, {'start': started, 'duration_minutes': args.duration_minutes,
+                              'next_slot': next_slot, 'retry_used': False, 'boot_id': boot_id()})
+        count += 1
+        if args.cycles and count >= args.cycles:
+            return 0
+        target = slot = next_slot
 
 if __name__ == '__main__':
     sys.exit(main())

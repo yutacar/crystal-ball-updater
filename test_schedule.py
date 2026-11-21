@@ -229,29 +229,175 @@ class CycleTests(unittest.TestCase):
         self.assertNotIn('off', self.events)
 
 
-class FailureRecordTests(unittest.TestCase):
-    def test_failure_record_says_where_usb_was_left(self):
-        with tempfile.TemporaryDirectory() as d:
-            args = SimpleNamespace(state_dir=Path(d), cycles=1, interval_minutes=30, lead_minutes=3)
-            def fail(a, start):
-                a.usb_state = 'disconnected_old_movie'
-                raise RuntimeError('transfer deadline too close')
-            with patch.object(m, 'parse_args', return_value=args), \
-                 patch.object(m, 'cycle', side_effect=fail), self.assertLogs('crystal-updater'):
-                self.assertEqual(m.main(), 1)
-            record = json.loads((Path(d)/'last_failure.json').read_text())
-            self.assertEqual(record['usb'], 'disconnected_old_movie')
+class Stop(BaseException):
+    """Ends the daemon loop in tests."""
+
+
+class RunTests(unittest.TestCase):
+    """Daemon loop: one retry before the movie on screen ends, and schedule restore."""
+
+    def setUp(self):
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        self.state = Path(directory.name)
+        self.args = SimpleNamespace(state_dir=self.state, cycles=0, interval_minutes=30,
+                                    duration_minutes=35, lead_minutes=3, retry_before_end_minutes=1)
+        self.clock = Clock(START - timedelta(minutes=4))   # fresh schedule starts at START
+        self.boot = 'boot-a'
+        self.starts = []
+
+    def run_loop(self, outcomes):
+        outcomes = list(outcomes)
+
+        def fake_cycle(args, start):
+            self.starts.append(start)
+            if not outcomes:
+                raise Stop
+            outcome = outcomes.pop(0)
+            if outcome == 'ok':
+                self.clock.at = start
+                args.usb_state = 'disconnected'
+                return start
+            # Preparation failures happen before the connect deadline; later ones at start.
+            self.clock.at = start - timedelta(seconds=50) if outcome == 'not_connected' else start
+            args.usb_state = outcome
+            raise RuntimeError(f'failed with usb={outcome}')
+
+        with patch.object(m, 'now', self.clock), \
+             patch.object(m, 'sleep_until', side_effect=self.clock.sleep_until), \
+             patch.object(m, 'boot_id', side_effect=lambda: self.boot), \
+             patch.object(m, 'cycle', side_effect=fake_cycle), \
+             self.assertLogs('crystal-updater', 'INFO') as self.logs:
+            try:
+                return m.run(self.args)
+            except Stop:
+                return 'stopped'
+
+    def failure(self):
+        return json.loads((self.state/'last_failure.json').read_text())
+
+    def playback(self):
+        return json.loads((self.state/'playback.json').read_text())
+
+    def write_playback(self, start, retry_used=False, boot='boot-a'):
+        (self.state/'playback.json').write_text(json.dumps({
+            'start': start.isoformat(), 'duration_minutes': 35,
+            'next_slot': (start + timedelta(minutes=30)).isoformat(),
+            'retry_used': retry_used, 'boot_id': boot}))
+
+    # --- retry within one process -------------------------------------------------
+
+    def test_preparation_failure_retries_one_minute_before_the_movie_ends(self):
+        slot1, retry = START + timedelta(minutes=30), START + timedelta(minutes=34)
+        self.assertEqual(self.run_loop(['ok', 'not_connected', 'ok']), 'stopped')
+        self.assertEqual(self.starts, [START, slot1, retry, START + timedelta(minutes=60)])
+        record = self.failure()
+        self.assertEqual(record['retry_at'], retry.isoformat())
+        self.assertTrue(record['old_movie_uninterrupted'])
+        self.assertEqual(self.playback()['start'], retry.isoformat())
+        self.assertEqual(self.playback()['next_slot'], (START + timedelta(minutes=60)).isoformat())
+        self.assertFalse(self.playback()['retry_used'])
+
+    def test_retry_uses_a_movie_for_the_retry_time(self):
+        self.run_loop(['ok', 'not_connected'])
+        self.assertEqual(self.starts[-1], START + timedelta(minutes=34))
+
+    def test_retry_happens_only_once(self):
+        self.assertEqual(self.run_loop(['ok', 'not_connected', 'not_connected']), 1)
+        self.assertEqual(len(self.starts), 3)
+        self.assertIsNone(self.failure()['retry_at'])
+
+    def test_failure_after_usb_connected_is_not_retried(self):
+        for usb in ('connected', 'disconnected_old_movie'):
+            with self.subTest(usb=usb):
+                self.setUp()
+                self.assertEqual(self.run_loop(['ok', usb]), 1)
+                self.assertEqual(len(self.starts), 2)
+                self.assertEqual(self.failure()['usb'], usb)
+                self.assertFalse(self.failure()['old_movie_uninterrupted'])
+                self.assertIsNone(self.failure()['retry_at'])
+
+    def test_no_retry_without_a_known_movie_on_screen(self):
+        self.assertEqual(self.run_loop(['not_connected']), 1)
+        self.assertEqual(self.starts, [START])
+        self.assertTrue(self.failure()['old_movie_uninterrupted'])
+
+    def test_retry_disabled(self):
+        self.args.retry_before_end_minutes = 0
+        self.assertEqual(self.run_loop(['ok', 'not_connected']), 1)
+
+    def test_one_shot_runs_neither_restore_nor_retry(self):
+        self.args.cycles = 1
+        self.write_playback(START - timedelta(minutes=10))
+        self.assertEqual(self.run_loop(['not_connected']), 1)
+        self.assertEqual(self.starts, [START])
+
+    # --- restart ------------------------------------------------------------------
+
+    def test_restart_continues_on_the_next_slot(self):
+        last = START - timedelta(minutes=30)
+        self.write_playback(last)
+        self.clock.at = START - timedelta(minutes=20)
+        self.run_loop([])
+        self.assertEqual(self.starts, [START])
+
+    def test_restart_after_the_slot_uses_the_retry_once(self):
+        last = START - timedelta(minutes=30)
+        self.write_playback(last)
+        self.clock.at = START + timedelta(minutes=1)        # retry prepares at START+1
+        self.run_loop([])
+        self.assertEqual(self.starts, [START + timedelta(minutes=4)])
+        self.assertTrue(self.playback()['retry_used'])
+
+    def test_restart_does_not_repeat_a_consumed_retry(self):
+        self.write_playback(START - timedelta(minutes=30), retry_used=True)
+        self.clock.at = START + timedelta(minutes=1)
+        self.run_loop([])
+        self.assertEqual(self.starts, [START + timedelta(minutes=5)])   # fresh schedule
+
+    def test_restart_after_the_old_movie_is_too_old_starts_fresh(self):
+        self.write_playback(START - timedelta(minutes=30))
+        self.clock.at = START + timedelta(minutes=2)
+        self.run_loop([])
+        self.assertEqual(self.starts, [START + timedelta(minutes=6)])
+
+    def test_restart_after_reboot_starts_fresh(self):
+        self.write_playback(START - timedelta(minutes=30), boot='boot-b')
+        self.clock.at = START - timedelta(minutes=20)
+        self.run_loop([])
+        self.assertEqual(self.starts, [START - timedelta(minutes=16)])
 
     def test_restart_ignores_corrupt_state_files(self):
-        # The schedule is never restored from state files, so corruption cannot block a restart.
-        with tempfile.TemporaryDirectory() as d:
-            for name in ('last_success.json', 'last_failure.json'):
-                (Path(d)/name).write_text('{broken')
-            args = SimpleNamespace(state_dir=Path(d), cycles=1, interval_minutes=30, lead_minutes=3)
-            with patch.object(m, 'parse_args', return_value=args), \
-                 patch.object(m, 'cycle', return_value=START) as cycle:
-                self.assertEqual(m.main(), 0)
-            self.assertIsNone(cycle.call_args.args[1])
+        for name in ('playback.json', 'last_success.json', 'last_failure.json'):
+            (self.state/name).write_text('{broken')
+        self.run_loop([])
+        self.assertEqual(self.starts, [START])
+        self.assertTrue(any('ignoring unreadable' in line for line in self.logs.output))
+
+    def test_restart_ignores_timestamps_without_offset(self):
+        (self.state/'playback.json').write_text(json.dumps({
+            'start': '2026-11-16T12:00:00', 'duration_minutes': 35,
+            'next_slot': '2026-11-16T12:30:00', 'retry_used': False, 'boot_id': 'boot-a'}))
+        self.run_loop([])
+        self.assertEqual(self.starts, [START])
+
+
+class PlaybackRecordTests(CycleTests):
+    """cycle() forgets the movie on screen exactly when it connects USB."""
+
+    def setUp(self):
+        super().setUp()
+        (self.state/'playback.json').write_text('{}')
+
+    def test_connecting_forgets_the_old_movie(self):
+        self.run_cycle()
+        self.assertFalse((self.state/'playback.json').exists())
+
+    def test_aborting_before_connecting_keeps_it(self):
+        self.producer_seconds = 140
+        with self.assertRaises(RuntimeError):
+            self.run_cycle()
+        self.assertTrue((self.state/'playback.json').exists())
 
 
 class ConnectSettingTests(unittest.TestCase):
@@ -260,12 +406,15 @@ class ConnectSettingTests(unittest.TestCase):
     def test_defaults(self):
         a = m.parse_args(self.BASE)
         self.assertEqual((a.connect_before_seconds, a.connect_deadline_seconds), (60, 45))
+        self.assertEqual(a.retry_before_end_minutes, 1)
         self.assertFalse(a.resume_old_on_abort)
 
     def test_invalid_relations_rejected(self):
         for extra in (['--connect-deadline-seconds', '70'],            # after connect window
                       ['--connect-deadline-seconds', '15'],            # no transfer margin
-                      ['--connect-before-seconds', '200']):            # beyond lead time
+                      ['--connect-before-seconds', '200'],             # beyond lead time
+                      ['--retry-before-end-minutes', '-1'],
+                      ['--retry-before-end-minutes', '35']):           # whole movie
             with self.subTest(extra=extra), contextlib.redirect_stderr(io.StringIO()), \
                  self.assertRaises(SystemExit):
                 m.parse_args(self.BASE + extra)

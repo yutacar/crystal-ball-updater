@@ -12,6 +12,7 @@
   "connect_before_seconds": 60,
   "connect_deadline_seconds": 45,
   "resume_old_on_abort": true,
+  "retry_before_end_minutes": 1,
   "producer_command": ["/usr/bin/python3", "/home/pi/.local/share/crystal-ball-updater/assemble_playlist.py",
     "--clips-dir", "/home/pi/.local/share/crystal-ball-updater/clips",
     "--duration-minutes", "{duration}", "--output", "{output}"],
